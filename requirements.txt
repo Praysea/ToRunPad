@@ -1,1 +1,7 @@
-runpod
+# torch/torchvision 由基础镜像自带（见 Dockerfile），这里只装推理相关的
+runpod==1.12.0
+diffusers>=0.31,<1.0
+transformers>=4.44,<5
+accelerate>=0.34
+peft>=0.13
+safetensors>=0.4.3

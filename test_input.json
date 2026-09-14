@@ -1,5 +1,13 @@
 {
     "input": {
-        "prompt": "Hey there!"
+        "prompt": "standing, full body, 1boy, solo, male focus, fox, furry, anthro, long hair, masterpiece, best quality",
+        "negative_prompt": "worst quality, low quality, blurry, watermark, bad anatomy, extra limbs, female",
+        "width": 832,
+        "height": 1152,
+        "steps": 25,
+        "cfg": 6.0,
+        "seed": 2028,
+        "clip_skip": 2,
+        "format": "png"
     }
 }
