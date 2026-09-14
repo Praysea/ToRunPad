@@ -21,7 +21,12 @@ _VOLUME = "/runpod-volume"
 
 import runpod  # noqa: E402
 import torch  # noqa: E402
-from diffusers import EulerAncestralDiscreteScheduler, StableDiffusionXLPipeline  # noqa: E402
+from diffusers import (  # noqa: E402
+    DPMSolverMultistepScheduler,
+    EulerAncestralDiscreteScheduler,
+    EulerDiscreteScheduler,
+    StableDiffusionXLPipeline,
+)
 
 # cached models 的落盘位置：RunPod 会把 HF_HOME 指到 /runpod-volume/huggingface-cache
 _HF_CACHE = os.path.join(
@@ -94,7 +99,6 @@ def load_pipe(model_path):
     # 对齐 ComfyUI 的 euler_ancestral + normal
     pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
     pipe.set_progress_bar_config(disable=True)
-    pipe.enable_vae_tiling()  # 832x1152 这类大图解码时省显存
 
     if os.environ.get("CPU_OFFLOAD") == "1":
         pipe.enable_model_cpu_offload()
@@ -104,6 +108,55 @@ def load_pipe(model_path):
     _pipe, _current_ckpt = pipe, model_path
     print(f"[worker] 底模加载完成 {os.path.basename(model_path)} 耗时 {time.time() - t0:.1f}s")
     return pipe
+
+
+def configure(pipe, inp):
+    """逐请求覆盖采样器/VAE 设置。用来做单变量对照，不用重建镜像。"""
+    spacing = inp.get("timestep_spacing")
+    pred = inp.get("prediction_type")
+    sched_name = inp.get("scheduler")
+    if spacing or pred or sched_name:
+        cfg = dict(pipe.scheduler.config)
+        if spacing:
+            cfg["timestep_spacing"] = spacing
+        if pred:
+            cfg["prediction_type"] = pred
+        cls = {
+            "euler_ancestral": EulerAncestralDiscreteScheduler,
+            "euler": EulerDiscreteScheduler,
+            "dpmpp_2m": DPMSolverMultistepScheduler,
+        }.get(sched_name or "euler_ancestral")
+        pipe.scheduler = cls.from_config(cfg)
+
+    vae_dtype = inp.get("vae_dtype")
+    if vae_dtype == "fp32" and pipe.vae.dtype != torch.float32:
+        pipe.vae.to(torch.float32)
+    elif vae_dtype == "fp16" and pipe.vae.dtype != torch.float16:
+        pipe.vae.to(torch.float16)
+
+    if "vae_tiling" in inp:
+        if inp["vae_tiling"]:
+            pipe.enable_vae_tiling()
+        else:
+            pipe.disable_vae_tiling()
+
+
+def pipeline_info(pipe):
+    """把实际生效的管线配置回传，方便远端核对（本地看不到 worker 内部）。"""
+    sc = pipe.scheduler.config
+    return {
+        "unet_prediction_type": pipe.unet.config.prediction_type,
+        "scheduler": type(pipe.scheduler).__name__,
+        "scheduler_prediction_type": sc.get("prediction_type"),
+        "timestep_spacing": sc.get("timestep_spacing"),
+        "steps_offset": sc.get("steps_offset"),
+        "num_train_timesteps": sc.get("num_train_timesteps"),
+        "unet_dtype": str(pipe.unet.dtype),
+        "vae_dtype": str(pipe.vae.dtype),
+        "vae_force_upcast": bool(getattr(pipe.vae.config, "force_upcast", False)),
+        "vae_tiling": bool(getattr(pipe.vae, "use_tiling", False)),
+        "text_encoder_dtype": str(pipe.text_encoder.dtype),
+    }
 
 
 def apply_lora(pipe, lora_path, scale):
@@ -163,6 +216,7 @@ def handler(job):
     runpod.serverless.progress_update(job, "加载模型")
     pipe = load_pipe(model_path)
     apply_lora(pipe, lora_path, lora_scale)
+    configure(pipe, inp)
 
     def on_step_end(_pipe, step, _timestep, kwargs):
         if step % 5 == 0 or step == steps - 1:
@@ -217,6 +271,7 @@ def handler(job):
         "model": os.path.basename(model_path),
         "lora": os.path.basename(lora_path) if lora_path else None,
         "elapsed": round(time.time() - t0, 1),
+        "pipeline": pipeline_info(pipe),
     }
 
 
