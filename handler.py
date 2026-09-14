@@ -141,11 +141,16 @@ def configure(pipe, inp):
             pipe.disable_vae_tiling()
 
 
+def _cfg(config, key):
+    """diffusers 的 FrozenDict 只认 .get()，点号访问会 AttributeError。"""
+    return config.get(key) if hasattr(config, "get") else getattr(config, key, None)
+
+
 def pipeline_info(pipe):
     """把实际生效的管线配置回传，方便远端核对（本地看不到 worker 内部）。"""
     sc = pipe.scheduler.config
     return {
-        "unet_prediction_type": pipe.unet.config.prediction_type,
+        "unet_prediction_type": _cfg(pipe.unet.config, "prediction_type"),
         "scheduler": type(pipe.scheduler).__name__,
         "scheduler_prediction_type": sc.get("prediction_type"),
         "timestep_spacing": sc.get("timestep_spacing"),
@@ -177,6 +182,100 @@ def apply_lora(pipe, lora_path, scale):
 
     if lora_path is not None:
         pipe.set_adapters(["lora"], adapter_weights=[scale])
+
+
+CLIP_CHUNK = 75  # CLIP 的位置上限是 77，留 2 个给 BOS/EOS
+
+
+def _special_ids(tokenizer):
+    bos = getattr(tokenizer, "bos_token_id", None) or tokenizer.convert_tokens_to_ids("<|startoftext|>")
+    eos = getattr(tokenizer, "eos_token_id", None) or tokenizer.convert_tokens_to_ids("<|endoftext|>")
+    return bos, eos
+
+
+def _token_chunks(tokenizer, text):
+    """按 75 个 content token 切段，每段 BOS + 内容 + EOS，末尾用 pad 补满 77。
+
+    pad token 就是 EOS，补在真实 EOS 之后；CLIP 的 pooler 用 argmax 找第一个
+    EOS，所以补出来的 pad 不会污染 pooled 输出。
+    """
+    bos, eos = _special_ids(tokenizer)
+    pad = getattr(tokenizer, "pad_token_id", None)
+    pad = eos if pad is None else pad
+    ids = tokenizer(text, truncation=False, add_special_tokens=False, verbose=False)["input_ids"]
+    chunks = [[bos, *ids[i:i + CLIP_CHUNK], eos] for i in range(0, len(ids), CLIP_CHUNK)]
+    if not chunks:
+        chunks = [[bos, eos]]
+    return [c + [pad] * (CLIP_CHUNK + 2 - len(c)) for c in chunks]
+
+
+def _pad_chunks(chunks, size, tokenizer):
+    """用空段占位，让正负提示词的序列长度一致（pipeline 要把两者 cat 起来）。"""
+    if len(chunks) >= size:
+        return chunks
+    return chunks + [_token_chunks(tokenizer, "")[0]] * (size - len(chunks))
+
+
+def _encode_chunks(text_encoder, chunks, real, clip_skip):
+    """分段编码后把序列维拼回去；pooled 取最后一段真实内容的 EOS 输出。"""
+    device = next(text_encoder.parameters()).device
+    ids = torch.tensor(chunks, dtype=torch.long, device=device)
+    out = text_encoder(ids, output_hidden_states=True)
+
+    # 层号约定跟 diffusers 原生 encode_prompt 保持一致，不额外引入变量
+    layer = -1 if clip_skip is None else -(clip_skip + 2)
+    hidden = out.hidden_states[layer]
+    hidden = hidden.reshape(1, -1, hidden.shape[-1])
+
+    # CLIP-G 的 out[0] 才是 2D 的 pooled 投影，CLIP-L 的 out[0] 是 last_hidden_state
+    pooled = out[0][real - 1:real] if out[0].ndim == 2 else None
+    return hidden, pooled
+
+
+def encode_prompt_long(pipe, prompt, negative_prompt, clip_skip):
+    """ComfyUI / A1111 同款的长提示词编码。
+
+    diffusers 原生 encode_prompt 写死 truncation=True 砍到 77 token，超出部分直接丢，
+    而本地 ComfyUI 的 CLIPTextEncode 是按 75 token 分段再拼接的——这就是同一个模型
+    本地正常、云端画风跑偏的原因。这里补上分段拼接。
+    返回 (prompt_embeds, pooled_prompt_embeds, negative_prompt_embeds, negative_pooled)。
+    """
+    pairs = [(pipe.text_encoder, pipe.tokenizer)]
+    if pipe.text_encoder_2 is not None:
+        pairs.append((pipe.text_encoder_2, pipe.tokenizer_2))
+
+    # 两个 tokenizer 的 vocab 相同但长度上限各自独立，先统一算出段数
+    plans = []
+    size = 1
+    for text_encoder, tokenizer in pairs:
+        pos = _token_chunks(tokenizer, prompt)
+        neg = _token_chunks(tokenizer, negative_prompt or "")
+        size = max(size, len(pos), len(neg))
+        plans.append((text_encoder, tokenizer, pos, neg))
+
+    embeds_list, pooled = [], None
+    for text_encoder, tokenizer, pos, neg in plans:
+        pos_embeds, pos_pooled = _encode_chunks(
+            text_encoder, _pad_chunks(pos, size, tokenizer), len(pos), clip_skip
+        )
+        neg_embeds, neg_pooled = _encode_chunks(
+            text_encoder, _pad_chunks(neg, size, tokenizer), len(neg), clip_skip
+        )
+        embeds_list.append((pos_embeds, neg_embeds))
+        if pos_pooled is not None:
+            pooled = (pos_pooled, neg_pooled)
+
+    if pooled is None:
+        raise ValueError("管线里没有带投影的文本编码器（CLIP-G），取不到 pooled 输出")
+
+    prompt_embeds = torch.cat([p for p, _ in embeds_list], dim=-1)
+    negative_prompt_embeds = torch.cat([n for _, n in embeds_list], dim=-1)
+
+    # 空负向提示词要跟原生路径一样走全零，否则会退化成「只有一个 BOS/EOS」的语义
+    if not (negative_prompt or "").strip() and getattr(pipe.config, "force_zeros_for_empty_prompt", False):
+        return prompt_embeds, pooled[0], torch.zeros_like(prompt_embeds), torch.zeros_like(pooled[0])
+
+    return prompt_embeds, pooled[0], negative_prompt_embeds, pooled[1]
 
 
 def _validate_size(width, height):
@@ -224,17 +323,37 @@ def handler(job):
         return kwargs
 
     t0 = time.time()
+    negative_prompt = inp.get("negative_prompt", "")
+    prompt_chunks = None
+    if inp.get("long_prompt", True):
+        # 默认走分段编码：长提示词不会被 77 token 截断
+        prompt_embeds, pooled, neg_embeds, neg_pooled = encode_prompt_long(
+            pipe, prompt, negative_prompt, clip_skip or None
+        )
+        prompt_chunks = prompt_embeds.shape[1] // pipe.tokenizer.model_max_length
+        gen_kwargs = {
+            "prompt_embeds": prompt_embeds,
+            "pooled_prompt_embeds": pooled,
+            "negative_prompt_embeds": neg_embeds,
+            "negative_pooled_prompt_embeds": neg_pooled,
+        }
+    else:
+        # long_prompt=false 回退到 diffusers 原生路径，用来做单变量对照
+        gen_kwargs = {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "clip_skip": clip_skip or None,
+        }
+
     result = pipe(
-        prompt=prompt,
-        negative_prompt=inp.get("negative_prompt", ""),
         width=width,
         height=height,
         num_inference_steps=steps,
         guidance_scale=cfg,
         num_images_per_prompt=batch,
         generator=torch.Generator(device="cuda").manual_seed(seed),
-        clip_skip=clip_skip or None,
         callback_on_step_end=on_step_end,
+        **gen_kwargs,
     )
 
     save_dir = os.path.join(OUTPUT_DIR, inp.get("output_subdir") or "gen")
@@ -271,6 +390,7 @@ def handler(job):
         "model": os.path.basename(model_path),
         "lora": os.path.basename(lora_path) if lora_path else None,
         "elapsed": round(time.time() - t0, 1),
+        "prompt_chunks": prompt_chunks,
         "pipeline": pipeline_info(pipe),
     }
 
