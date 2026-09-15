@@ -222,8 +222,9 @@ def _encode_chunks(text_encoder, chunks, real, clip_skip):
     ids = torch.tensor(chunks, dtype=torch.long, device=device)
     out = text_encoder(ids, output_hidden_states=True)
 
-    # 层号约定跟 diffusers 原生 encode_prompt 保持一致，不额外引入变量
-    layer = -1 if clip_skip is None else -(clip_skip + 2)
+    # ComfyUI / A1111 的 clip skip=k 就是取第 k 层（从末尾数），k=2 即倒数第二层。
+    # diffusers 的 clip_skip=None 默认取的也是倒数第二层，两者在这里对齐。
+    layer = -clip_skip if clip_skip else -2
     hidden = out.hidden_states[layer]
     hidden = hidden.reshape(1, -1, hidden.shape[-1])
 
