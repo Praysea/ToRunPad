@@ -1,0 +1,22 @@
+runpod_worker_comfy:
+  base_path: /runpod-volume
+  checkpoints: models/checkpoints/
+  clip: models/clip/
+  clip_vision: models/clip_vision/
+  configs: models/configs/
+  controlnet: models/controlnet/
+  embeddings: models/embeddings/
+  loras: models/loras/
+  upscale_models: models/upscale_models/
+  vae: models/vae/
+  unet: models/unet/
+
+# RunPod 的 "Cached models" 并不按上面的 models/ 布局挂载，而是一份 HF 缓存：
+#   <hub>/models--<org>--<repo>/snapshots/<commit>/<file>
+# 路径里带 commit 哈希，没法写死在 workflow 的 ckpt_name 里。start.sh 会在启动
+# 前把其中的权重软链到 /runpod-modellinks 下的扁平目录，这里再把那个目录注册给
+# ComfyUI，于是 workflow 里直接写文件名即可，也就不用另建网络卷重传几 GB 底模。
+runpod_cached_models:
+  base_path: /runpod-modellinks
+  checkpoints: checkpoints/
+  loras: loras/
